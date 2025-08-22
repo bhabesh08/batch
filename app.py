@@ -1,283 +1,341 @@
-# streamlit_app.py
+# app.py
 import math
-from datetime import datetime, timezone
-import pandas as pd
-import numpy as np
+from datetime import datetime, timedelta
+from typing import List, Tuple
+
 import altair as alt
+import numpy as np
+import pandas as pd
 import streamlit as st
 
+# -----------------------------
+# Page config
+# -----------------------------
 st.set_page_config(page_title="Pipeline Batch Tracker", layout="wide")
+
+st.title("Pipeline Batch Tracker")
+st.caption("Compute batch locations along a multi-section pipeline given a pumping plan, pipeline geometry, "
+           "flow rate, and start/view times. Assumes plug flow, incompressible fluids, and inner diameter = "
+           "diameter − 2×wall thickness (inches).")
 
 # -----------------------------
 # Helpers
 # -----------------------------
 INCH_TO_M = 0.0254
-KM_TO_M = 1_000.0
+KM_TO_M = 1000.0
 
 BATCH_TYPES = ["LS", "HS", "MS", "HSD", "ATF"]
-TYPE_COLORS = {
-    "LS": "#1f77b4",
-    "HS": "#ff7f0e",
-    "MS": "#2ca02c",
-    "HSD": "#d62728",
-    "ATF": "#9467bd",
-}
 
-def sanitize_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    out = df.copy()
-    for c in cols:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-    return out
+def sanitize_positive(x, name):
+    try:
+        v = float(x)
+        return max(v, 0.0)
+    except Exception:
+        st.warning(f"Non-numeric value in {name}; treating as 0.")
+        return 0.0
 
-def build_pipeline_profile(sections_df: pd.DataFrame):
-    df = sections_df.copy()
-    df = sanitize_numeric(df, ["diameter_in", "wall_in", "length_km"]).fillna(0.0)
-    df["id_m"] = (df["diameter_in"] - 2.0 * df["wall_in"]) * INCH_TO_M
-    df["id_m"] = df["id_m"].clip(lower=0.0)
-    df["area_m2"] = math.pi * (df["id_m"] / 2.0) ** 2
-    df["length_m"] = df["length_km"] * KM_TO_M
-    df["capacity_m3"] = df["area_m2"] * df["length_m"]
-    df["capacity_m3"] = df["capacity_m3"].fillna(0.0).clip(lower=0.0)
-    capacities = df["capacity_m3"].to_numpy()
-    areas = df["area_m2"].to_numpy()
-    lengths_m = df["length_m"].to_numpy()
-    cum_cap = np.concatenate([[0.0], np.cumsum(capacities)])
-    cum_len_m = np.concatenate([[0.0], np.cumsum(lengths_m)])
-    profile = {
-        "df": df,
-        "areas": areas,
-        "capacities": capacities,
-        "lengths_m": lengths_m,
-        "cum_cap": cum_cap,
-        "cum_len_m": cum_len_m,
-        "total_cap": float(cum_cap[-1]),
-        "total_len_km": float(cum_len_m[-1] / KM_TO_M),
+def sections_from_df(df_sec: pd.DataFrame):
+    """Compute per-section inner diameter, area, length, volume, and cumulative arrays."""
+    # Expect columns: diameter_inch, wall_inch, length_km
+    di_in = df_sec["diameter (inch)"].astype(float).to_numpy()
+    wt_in = df_sec["wall thickness (inch)"].astype(float).to_numpy()
+    L_km  = df_sec["length (km)"].astype(float).to_numpy()
+
+    # Inner diameter in meters (ensure non-negative)
+    ID_m = (di_in - 2.0 * wt_in) * INCH_TO_M
+    ID_m = np.where(ID_m > 0, ID_m, 0.0)
+
+    A_m2 = (np.pi / 4.0) * ID_m**2
+    L_m  = L_km * KM_TO_M
+    V_m3 = A_m2 * L_m
+
+    cumV = np.concatenate(([0.0], np.cumsum(V_m3)))
+    cumL = np.concatenate(([0.0], np.cumsum(L_m)))
+
+    return {
+        "ID_m": ID_m,
+        "A_m2": A_m2,
+        "L_m": L_m,
+        "V_m3": V_m3,
+        "cumV": cumV,
+        "cumL": cumL,
+        "V_total": V_m3.sum(),
+        "L_total": L_m.sum(),
     }
-    return profile
 
-def volume_to_distance_km(V: float, profile: dict) -> float:
-    Vcap = profile["total_cap"]
-    if V <= 0.0:
-        return 0.0
-    if V >= Vcap and Vcap > 0:
-        return profile["total_len_km"]
-    if Vcap == 0:
-        return 0.0
-    cum_cap = profile["cum_cap"]
-    cum_len_m = profile["cum_len_m"]
-    areas = profile["areas"]
-    k = int(np.searchsorted(cum_cap, V, side="right") - 1)
-    k = max(0, min(k, len(areas) - 1))
-    V_prev = cum_cap[k]
-    A_k = areas[k] if areas[k] > 0 else 1e-12
-    dx_m = (V - V_prev) / A_k
-    dist_m = cum_len_m[k] + dx_m
-    return max(0.0, min(dist_m / KM_TO_M, profile["total_len_km"]))
+def dist_from_local_volume(local_v: np.ndarray, A_m2: np.ndarray, cumV: np.ndarray, cumL: np.ndarray) -> np.ndarray:
+    """
+    Map local volume measured from inlet (0 .. V_total) to distance along pipeline (m).
+    Piecewise constant area per section.
+    """
+    # Clip within [0, V_total]
+    V_total = cumV[-1]
+    v = np.clip(local_v, 0.0, V_total)
 
-def batch_intervals_by_time(batches_df: pd.DataFrame, profile: dict, flow_m3h: float,
-                            start_dt: datetime, selected_dt: datetime):
-    dt_hours = max(0.0, (selected_dt - start_dt).total_seconds() / 3600.0)
-    V_disp = max(0.0, flow_m3h) * dt_hours
-    df = batches_df.copy()
-    df = sanitize_numeric(df, ["volume_m3", "density_kgm3", "visc_cSt"]).fillna(0.0)
-    df = df[df["volume_m3"] > 0].reset_index(drop=True)
-    volumes = df["volume_m3"].to_numpy()
-    types = df["type"].astype(str).replace({np.nan: ""}).to_numpy()
-    cum_at_0 = np.concatenate([[0.0], np.cumsum(volumes)])
-    Vcap = profile["total_cap"]
+    # Find section index for each v (cumV[k] <= v < cumV[k+1])
+    idx = np.searchsorted(cumV[1:], v, side="right")
+    idx = np.clip(idx, 0, len(A_m2) - 1)
+
+    # Volume remaining inside section
+    v_in_sec = v - cumV[idx]
+    # Distance offset inside section: delta_x = v_in_sec / A
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dx = np.where(A_m2[idx] > 0, v_in_sec / A_m2[idx], 0.0)
+
+    return cumL[idx] + dx
+
+def compute_batch_segments_in_pipe(
+    batches_df: pd.DataFrame,
+    V_pipe: float,
+    V_displaced: float,
+    A_m2: np.ndarray,
+    cumV_sec: np.ndarray,
+    cumL_sec: np.ndarray
+):
+    """
+    For each batch (with start/end in pumped-volume axis), compute the overlap with the in-pipe window
+    [Vd - Vpipe, Vd], map to distances, and return per-batch segment info.
+    """
+    # Pumped-volume intervals for each batch
+    vols = batches_df["volume (m3)"].astype(float).clip(lower=0.0).to_numpy()
+    types = batches_df["type"].astype(str).to_numpy()
+    dens  = batches_df["density (kg/m3)"].astype(float).to_numpy()
+    visc  = batches_df["viscosity (cSt)"].astype(float).to_numpy()
+
+    v_starts = np.concatenate(([0.0], np.cumsum(vols)[:-1]))
+    v_ends   = np.cumsum(vols)
+
+    # In-pipe window
+    win_start = max(V_displaced - V_pipe, 0.0)
+    win_end   = max(min(V_displaced, v_ends[-1] if len(v_ends) else 0.0), 0.0)
+
+    segments = []
     rows = []
-    for i in range(len(df)):
-        V_i = volumes[i]
-        typ = types[i]
-        a_i = cum_at_0[i] + V_disp
-        b_i = a_i + V_i
-        L = max(0.0, a_i)
-        U = min(Vcap, b_i)
-        in_pipeline = max(0.0, U - L)
-        pct_in = 100.0 * (in_pipeline / V_i) if V_i > 0 else 0.0
-        if in_pipeline > 0.0 and Vcap > 0.0:
-            start_km = volume_to_distance_km(L, profile)
-            end_km = volume_to_distance_km(U, profile)
+
+    for i, (v0, v1, t, d, mu) in enumerate(zip(v_starts, v_ends, types, dens, visc)):
+        # Compute overlap with in-pipe window
+        ov_start = max(v0, win_start)
+        ov_end   = min(v1, win_end)
+        inside_vol = max(ov_end - ov_start, 0.0)
+
+        if inside_vol > 0:
+            # Map overlap to distances
+            local_start = ov_start - win_start  # 0 at inlet
+            local_end   = ov_end - win_start
+            x0 = float(dist_from_local_volume(np.array([local_start]), A_m2, cumV_sec, cumL_sec)[0])
+            x1 = float(dist_from_local_volume(np.array([local_end]),   A_m2, cumV_sec, cumL_sec)[0])
+            x_start, x_end = (min(x0, x1), max(x0, x1))
+            L_seg = x_end - x_start
+
+            segments.append({
+                "batch_index": i + 1,
+                "type": t,
+                "start_m": x_start,
+                "end_m": x_end,
+                "length_m": L_seg,
+                "density_kgm3": d,
+                "visc_cSt": mu,
+                "inside_vol_m3": inside_vol,
+            })
+
+            rows.append({
+                "Batch": i + 1,
+                "Type": t,
+                "Total volume (m3)": vols[i],
+                "In-pipe volume (m3)": inside_vol,
+                "Start (km)": x_start / KM_TO_M,
+                "End (km)": x_end / KM_TO_M,
+                "Center (km)": (x_start + x_end) / (2.0 * KM_TO_M),
+                "Percent inside (%)": 100.0 * inside_vol / vols[i] if vols[i] > 0 else 0.0,
+                "Status": "Inside",
+            })
         else:
-            start_km, end_km = None, None
-        if a_i >= Vcap and Vcap > 0:
-            status = "Delivered"
-        elif b_i <= 0:
-            status = "Not entered"
-        elif in_pipeline > 0.0:
-            status = "In pipeline"
-        else:
-            status = "N/A"
-        rows.append({
-            "batch_no": i + 1,
-            "type": typ,
-            "volume_m3": V_i,
-            "start_km": start_km,
-            "end_km": end_km,
-            "center_km": None if (start_km is None or end_km is None) else 0.5 * (start_km + end_km),
-            "in_pipeline_%": round(pct_in, 2),
-            "status": status,
-        })
-    out = pd.DataFrame(rows)
-    for c in ["start_km", "end_km", "center_km"]:
-        if c in out:
-            out[c] = out[c].astype(float).round(3)
-    return out
+            # Status outside the pipe
+            status = "Not yet entered" if v1 <= win_start else "Already passed"
+            rows.append({
+                "Batch": i + 1,
+                "Type": t,
+                "Total volume (m3)": vols[i],
+                "In-pipe volume (m3)": 0.0,
+                "Start (km)": None,
+                "End (km)": None,
+                "Center (km)": None,
+                "Percent inside (%)": 0.0,
+                "Status": status,
+            })
 
-def section_boundaries_df(profile: dict) -> pd.DataFrame:
-    km = profile["cum_len_m"] / KM_TO_M
-    return pd.DataFrame({"boundary_km": km[1:-1]})
+    seg_df = pd.DataFrame(segments)
+    loc_df = pd.DataFrame(rows)
+    return seg_df, loc_df
 
-# -----------------------------
-# Defaults
-# -----------------------------
-default_batches = pd.DataFrame({
-    "volume_m3": [5000, 6000, 4000],
-    "type": ["HSD", "MS", "ATF"],
-    "density_kgm3": [830, 750, 780],
-    "visc_cSt": [3.0, 1.2, 1.5],
-})
+def default_batches():
+    return pd.DataFrame([
+        {"volume (m3)": 1200.0, "type": "HSD", "density (kg/m3)": 830.0, "viscosity (cSt)": 3.0},
+        {"volume (m3)": 900.0,  "type": "MS",  "density (kg/m3)": 740.0, "viscosity (cSt)": 1.0},
+        {"volume (m3)": 1500.0, "type": "ATF", "density (kg/m3)": 800.0, "viscosity (cSt)": 1.5},
+    ])
 
-default_sections = pd.DataFrame({
-    "section": [1, 2, 3],
-    "diameter_in": [24.0, 24.0, 18.0],
-    "wall_in": [0.5, 0.5, 0.375],
-    "length_km": [120.0, 80.0, 60.0],
-})
+def default_sections():
+    return pd.DataFrame([
+        {"pipeline section": "Section 1", "diameter (inch)": 18.0, "wall thickness (inch)": 0.375, "length (km)": 40.0},
+        {"pipeline section": "Section 2", "diameter (inch)": 16.0, "wall thickness (inch)": 0.344, "length (km)": 60.0},
+        {"pipeline section": "Section 3", "diameter (inch)": 14.0, "wall thickness (inch)": 0.312, "length (km)": 50.0},
+    ])
 
 # -----------------------------
-# UI
+# Sidebar inputs
 # -----------------------------
-st.title("Pipeline Batch Tracker")
+with st.sidebar:
+    st.header("Operating inputs")
 
-with st.expander("Instructions", expanded=False):
-    st.markdown(
-        "- **Batches table:** Add rows in the order of injection. Provide volume (m3), type, density, and viscosity.\n"
-        "- **Pipeline sections:** Provide diameter and wall thickness (inch) and section length (km). Internal diameter is computed.\n"
-        "- **Timing:** Set pumping start and a target time. Flow is assumed constant.\n"
-        "- The visualization shows each batch's span along the pipeline in km."
-    )
+    flow_rate = st.number_input("Flow rate (m3/h)", min_value=0.0, value=800.0, step=50.0, format="%.2f")
 
-colA, colB = st.columns([1.2, 1.0], gap="large")
+    # Datetime inputs
+    start_dt = st.datetime_input("Start date & time", value=datetime.now() - timedelta(hours=2))
+    view_dt  = st.datetime_input("View date & time",  value=datetime.now())
 
-with colA:
-    st.subheader("Pumping plan in batches")
-    batches_df = st.data_editor(
-        default_batches,
-        key="batches",
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "volume_m3": st.column_config.NumberColumn("volume (m3)", min_value=0.0, step=100.0, format="%.0f"),
-            "type": st.column_config.SelectboxColumn("type", options=BATCH_TYPES),
-            "density_kgm3": st.column_config.NumberColumn("density (kg/m3)", min_value=0.0, step=1.0, format="%.0f"),
-            "visc_cSt": st.column_config.NumberColumn("viscosity (cSt)", min_value=0.0, step=0.1, format="%.1f"),
-        }
-    )
+    if view_dt < start_dt:
+        st.info("View time is before start time. No batches in pipe yet.")
+    elapsed_h = max((view_dt - start_dt).total_seconds() / 3600.0, 0.0)
 
-with colB:
-    st.subheader("Pipeline sections")
-    sections_df = st.data_editor(
-        default_sections,
-        key="sections",
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "section": st.column_config.NumberColumn("section", disabled=True),
-            "diameter_in": st.column_config.NumberColumn("diameter (inch)", min_value=0.0, step=0.5, format="%.3f"),
-            "wall_in": st.column_config.NumberColumn("wall thickness (inch)", min_value=0.0, step=0.125, format="%.3f"),
-            "length_km": st.column_config.NumberColumn("length (km)", min_value=0.0, step=1.0, format="%.1f"),
-        }
-    )
+# -----------------------------
+# Main inputs: tables
+# -----------------------------
+st.subheader("Pumping plan (batches)")
+batch_df = st.data_editor(
+    default_batches(),
+    num_rows="dynamic",
+    use_container_width=True,
+    column_config={
+        "volume (m3)": st.column_config.NumberColumn("volume (m3)", min_value=0.0, step=10.0, format="%.2f"),
+        "type": st.column_config.SelectboxColumn("type", options=BATCH_TYPES),
+        "density (kg/m3)": st.column_config.NumberColumn("density (kg/m3)", min_value=0.0, step=1.0, format="%.1f"),
+        "viscosity (cSt)": st.column_config.NumberColumn("viscosity (cSt)", min_value=0.0, step=0.1, format="%.2f"),
+    },
+    key="batches",
+)
 
-st.subheader("Flow and time")
-col1, col2, col3 = st.columns([1, 1, 1.2], gap="large")
-with col1:
-    flow_m3h = st.number_input("Flow rate (m3/h)", min_value=0.0, value=1500.0, step=50.0, format="%.1f")
-with col2:
-    start_date = st.date_input("Pumping start date", value=datetime.now(timezone.utc).astimezone().date())
-    start_time = st.time_input("Pumping start time", value=datetime.now(timezone.utc).astimezone().time().replace(second=0, microsecond=0))
-    start_dt = datetime.combine(start_date, start_time)
-with col3:
-    selected_date = st.date_input("Show positions at date", value=datetime.now(timezone.utc).astimezone().date(), key="selected_date")
-    selected_time = st.time_input("Show positions at time", value=datetime.now(timezone.utc).astimezone().time().replace(second=0, microsecond=0), key="selected_time")
-    selected_dt = datetime.combine(selected_date, selected_time)
+st.subheader("Pipeline details (sections)")
+sec_df = st.data_editor(
+    default_sections(),
+    num_rows="dynamic",
+    use_container_width=True,
+    column_config={
+        "pipeline section": st.column_config.TextColumn("pipeline section"),
+        "diameter (inch)": st.column_config.NumberColumn("diameter (inch)", min_value=0.0, step=0.125, format="%.3f"),
+        "wall thickness (inch)": st.column_config.NumberColumn("wall thickness (inch)", min_value=0.0, step=0.01, format="%.3f"),
+        "length (km)": st.column_config.NumberColumn("length (km)", min_value=0.0, step=1.0, format="%.2f"),
+    },
+    key="sections",
+)
+
+# Validate basic inputs
+if batch_df.empty or sec_df.empty:
+    st.warning("Please provide both a pumping plan and pipeline sections.")
+    st.stop()
 
 # -----------------------------
 # Calculations
 # -----------------------------
-profile = build_pipeline_profile(sections_df)
+# Sections geometry
+ge = sections_from_df(sec_df)
+V_pipe = ge["V_total"]
+L_pipe = ge["L_total"]
 
-if profile["total_cap"] <= 0.0:
-    st.warning("Pipeline capacity is zero. Check diameters, wall thicknesses, and lengths.")
+# Displaced volume at view time
+V_displaced = flow_rate * elapsed_h
+
+# Batch segments currently inside the pipe
+seg_df, loc_df = compute_batch_segments_in_pipe(
+    batch_df, V_pipe, V_displaced, ge["A_m2"], ge["cumV"], ge["cumL"]
+)
+
+# -----------------------------
+# KPIs
+# -----------------------------
+kpi1, kpi2, kpi3 = st.columns(3)
+kpi1.metric("Pipeline length", f"{L_pipe / KM_TO_M:.2f} km")
+kpi2.metric("Pipeline capacity", f"{V_pipe:,.0f} m³")
+kpi3.metric("Displaced volume", f"{V_displaced:,.0f} m³")
+
+# -----------------------------
+# Locations table
+# -----------------------------
+st.subheader("Batch locations at selected time")
+st.dataframe(loc_df, use_container_width=True)
+
+# -----------------------------
+# Visualization
+# -----------------------------
+st.subheader("Pipeline view")
+
+# Base dataframe for plotting pipeline extent
+pipeline_base = pd.DataFrame({
+    "start_km": [0.0],
+    "end_km": [L_pipe / KM_TO_M],
+    "Type": ["Pipeline"],
+})
+
+# Convert segments to km for plotting
+if not seg_df.empty:
+    plot_df = seg_df.copy()
+    plot_df["start_km"] = plot_df["start_m"] / KM_TO_M
+    plot_df["end_km"]   = plot_df["end_m"]   / KM_TO_M
+    plot_df["Batch"]    = plot_df["batch_index"]
+    plot_df["Type"]     = plot_df["type"]
 else:
-    positions_df = batch_intervals_by_time(batches_df, profile, flow_m3h, start_dt, selected_dt)
-    k1, k2, k3 = st.columns(3)
-    with k1:
-        st.metric("Total pipeline length", f"{profile['total_len_km']:.2f} km")
-    with k2:
-        st.metric("Pipeline capacity", f"{profile['total_cap']:.0f} m³")
-    with k3:
-        dt_hours = max(0.0, (selected_dt - start_dt).total_seconds() / 3600.0)
-        st.metric("Displaced volume since start", f"{flow_m3h * dt_hours:.0f} m³")
+    plot_df = pd.DataFrame(columns=["start_km", "end_km", "Batch", "Type"])
 
-    st.divider()
+# Define color scheme for types
+color_scale = alt.Scale(
+    domain=["HSD", "MS", "ATF", "HS", "LS"],
+    range=["#3b82f6", "#ef4444", "#22c55e", "#a855f7", "#f59e0b"],
+)
 
-    st.subheader("Batch locations at selected time")
-    st.dataframe(
-        positions_df[["batch_no", "type", "volume_m3", "start_km", "end_km", "center_km", "in_pipeline_%", "status"]],
-        use_container_width=True
+# Pipeline base bar
+pipeline_chart = alt.Chart(pipeline_base).mark_bar(color="#e5e7eb").encode(
+    x="start_km:Q",
+    x2="end_km:Q",
+    y=alt.value(20),
+    tooltip=[alt.Tooltip("end_km:Q", title="Length (km)", format=".2f")]
+)
+
+# Batch segments bars
+if not plot_df.empty:
+    seg_chart = alt.Chart(plot_df).mark_bar().encode(
+        x=alt.X("start_km:Q", title="Distance along pipeline (km)", scale=alt.Scale(domain=[0, L_pipe / KM_TO_M])),
+        x2="end_km:Q",
+        y=alt.value(20),
+        color=alt.Color("Type:N", scale=color_scale),
+        tooltip=[
+            alt.Tooltip("Batch:Q"),
+            alt.Tooltip("Type:N"),
+            alt.Tooltip("start_km:Q", title="Start (km)", format=".2f"),
+            alt.Tooltip("end_km:Q", title="End (km)", format=".2f"),
+            alt.Tooltip("length_m:Q", title="Length (m)", format=".0f"),
+        ],
     )
+    chart = (pipeline_chart + seg_chart).properties(height=80, width=900)
+else:
+    chart = pipeline_chart.properties(height=80, width=900)
 
-    st.subheader("Visual representation along pipeline")
-    seg_rows = []
-    for _, r in positions_df.iterrows():
-        if pd.notna(r["start_km"]) and pd.notna(r["end_km"]) and (r["end_km"] > r["start_km"]):
-            seg_rows.append({
-                "Batch": f"Batch {int(r['batch_no'])} ({r['type']})",
-                "type": r["type"],
-                "x_start": float(r["start_km"]),
-                "x_end": float(r["end_km"]),
-                "length_km": float(r["end_km"] - r["start_km"]),
-            })
-    seg_df = pd.DataFrame(seg_rows)
-    x_scale = alt.Scale(domain=[0, max(0.001, profile["total_len_km"])])
-    if not seg_df.empty:
-        seg_df["color"] = seg_df["type"].map(TYPE_COLORS).fillna("#555")
-        bars = alt.Chart(seg_df).mark_bar(height=18).encode(
-            x=alt.X("x_start:Q", title="Distance from inlet (km)", scale=x_scale),
-            x2="x_end:Q",
-            y=alt.Y("Batch:N", sort=seg_df["Batch"].tolist(), title=None),
-            color=alt.Color("type:N", scale=alt.Scale(domain=list(TYPE_COLORS.keys()),
-                                                      range=list(TYPE_COLORS.values())),
-                            legend=alt.Legend(title="Type")),
-            tooltip=[
-                alt.Tooltip("Batch:N"),
-                alt.Tooltip("type:N", title="Type"),
-                alt.Tooltip("x_start:Q", title="Start (km)", format=".2f"),
-                alt.Tooltip("x_end:Q", title="End (km)", format=".2f"),
-                alt.Tooltip("length_km:Q", title="Span (km)", format=".2f"),
-            ],
-        )
-        boundaries = section_boundaries_df(profile)
-        rules = alt.Chart(boundaries).mark_rule(color="#999", strokeDash=[4, 4]).encode(
-            x=alt.X("boundary_km:Q", scale=x_scale),
-            tooltip=[alt.Tooltip("boundary_km:Q", title="Section boundary (km)", format=".2f")]
-        )
-        chart = (bars + rules).properties(height=max(80, 26 * len(seg_df) + 20), width=900)
-        st.altair_chart(chart, use_container_width=True)
-    else:
-        baseline = pd.DataFrame({"x": [0, profile["total_len_km"]], "y": ["Pipeline", "Pipeline"]})
-        chart = alt.Chart(baseline).mark_line().encode(
-            x=alt.X("x:Q", title="Distance from inlet (km)", scale=x_scale),
-            y=alt.Y("y:N", title=None)
-        ).properties(height=80, width=900)
-        st.altair_chart(chart, use_container_width=True)
+st.altair_chart(chart, use_container_width=True)
 
-    with st.expander("Assumptions and notes", expanded=False):
-        st.markdown(
-            "- **Constant flow** is assumed between start and selected times; no pump stops or transients.\n"
-            "- **Positions are volume-based**: batch boundaries move by displaced volume; conversion to distance accounts for varying diameters per section.\n"
-            "- **Internal diameter** is computed as (diameter − 2 × wall). Units: inch to meters.\n"
-            "- Batches beyond the outlet are marked Delivered; partial segments are clipped to the pipeline length."
-        )
+# -----------------------------
+# Section markers (optional)
+# -----------------------------
+with st.expander("Show pipeline section markers"):
+    # Create markers at section boundaries
+    boundaries_km = ge["cumL"] / KM_TO_M
+    marks = pd.DataFrame({"km": boundaries_km})
+    rule = alt.Chart(marks).mark_rule(color="#9ca3af", strokeDash=[4,4]).encode(x="km:Q")
+    st.altair_chart((chart + rule).properties(height=100, width=900), use_container_width=True)
+
+# -----------------------------
+# Notes
+# -----------------------------
+st.markdown("""
+- Assumes plug flow with sharp interfaces, no mixing or slippage.
+- Inner diameter is computed as `ID = diameter − 2 × wall thickness` (inches). Ensure inputs reflect OD and wall thickness consistently.
+- If view time is early, part of the line may be unfilled; if late, some batches may have already passed.
+""")
