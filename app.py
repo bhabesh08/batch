@@ -1,341 +1,286 @@
-# app.py
-import math
-from datetime import datetime, timedelta
-from typing import List, Tuple
-
-import altair as alt
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+import datetime
+import plotly.graph_objects as go
 
-# -----------------------------
-# Page config
-# -----------------------------
-st.set_page_config(page_title="Pipeline Batch Tracker", layout="wide")
+# --- Page Configuration ---
+st.set_page_config(
+    page_title="Pipeline Batch Tracker",
+    page_icon="🛤️",
+    layout="wide",
+)
 
-st.title("Pipeline Batch Tracker")
-st.caption("Compute batch locations along a multi-section pipeline given a pumping plan, pipeline geometry, "
-           "flow rate, and start/view times. Assumes plug flow, incompressible fluids, and inner diameter = "
-           "diameter − 2×wall thickness (inches).")
+# --- Helper Functions ---
 
-# -----------------------------
-# Helpers
-# -----------------------------
-INCH_TO_M = 0.0254
-KM_TO_M = 1000.0
+def convert_to_m(value, unit):
+    """Converts a value from a given unit to meters."""
+    if unit.lower() == 'inch':
+        return value * 0.0254
+    if unit.lower() == 'km':
+        return value * 1000
+    return value
 
-BATCH_TYPES = ["LS", "HS", "MS", "HSD", "ATF"]
-
-def sanitize_positive(x, name):
-    try:
-        v = float(x)
-        return max(v, 0.0)
-    except Exception:
-        st.warning(f"Non-numeric value in {name}; treating as 0.")
-        return 0.0
-
-def sections_from_df(df_sec: pd.DataFrame):
-    """Compute per-section inner diameter, area, length, volume, and cumulative arrays."""
-    # Expect columns: diameter_inch, wall_inch, length_km
-    di_in = df_sec["diameter (inch)"].astype(float).to_numpy()
-    wt_in = df_sec["wall thickness (inch)"].astype(float).to_numpy()
-    L_km  = df_sec["length (km)"].astype(float).to_numpy()
-
-    # Inner diameter in meters (ensure non-negative)
-    ID_m = (di_in - 2.0 * wt_in) * INCH_TO_M
-    ID_m = np.where(ID_m > 0, ID_m, 0.0)
-
-    A_m2 = (np.pi / 4.0) * ID_m**2
-    L_m  = L_km * KM_TO_M
-    V_m3 = A_m2 * L_m
-
-    cumV = np.concatenate(([0.0], np.cumsum(V_m3)))
-    cumL = np.concatenate(([0.0], np.cumsum(L_m)))
-
-    return {
-        "ID_m": ID_m,
-        "A_m2": A_m2,
-        "L_m": L_m,
-        "V_m3": V_m3,
-        "cumV": cumV,
-        "cumL": cumL,
-        "V_total": V_m3.sum(),
-        "L_total": L_m.sum(),
-    }
-
-def dist_from_local_volume(local_v: np.ndarray, A_m2: np.ndarray, cumV: np.ndarray, cumL: np.ndarray) -> np.ndarray:
+def get_distance_from_volume(volume_m3, cumulative_volumes, cumulative_lengths_km):
     """
-    Map local volume measured from inlet (0 .. V_total) to distance along pipeline (m).
-    Piecewise constant area per section.
+    Calculates the distance along the pipeline for a given pumped volume.
+    Returns distance in km.
     """
-    # Clip within [0, V_total]
-    V_total = cumV[-1]
-    v = np.clip(local_v, 0.0, V_total)
+    total_pipeline_volume = cumulative_volumes[-1]
+    total_pipeline_length = cumulative_lengths_km[-1]
 
-    # Find section index for each v (cumV[k] <= v < cumV[k+1])
-    idx = np.searchsorted(cumV[1:], v, side="right")
-    idx = np.clip(idx, 0, len(A_m2) - 1)
+    if volume_m3 <= 0:
+        return 0
+    if volume_m3 >= total_pipeline_volume:
+        return total_pipeline_length
 
-    # Volume remaining inside section
-    v_in_sec = v - cumV[idx]
-    # Distance offset inside section: delta_x = v_in_sec / A
-    with np.errstate(divide="ignore", invalid="ignore"):
-        dx = np.where(A_m2[idx] > 0, v_in_sec / A_m2[idx], 0.0)
+    # Find which section the volume falls into
+    section_index = np.searchsorted(cumulative_volumes, volume_m3, side='right')
 
-    return cumL[idx] + dx
+    # Volume and length of the pipeline up to the previous section
+    vol_before = cumulative_volumes[section_index - 1] if section_index > 0 else 0
+    len_before = cumulative_lengths_km[section_index - 1] if section_index > 0 else 0
 
-def compute_batch_segments_in_pipe(
-    batches_df: pd.DataFrame,
-    V_pipe: float,
-    V_displaced: float,
-    A_m2: np.ndarray,
-    cumV_sec: np.ndarray,
-    cumL_sec: np.ndarray
-):
-    """
-    For each batch (with start/end in pumped-volume axis), compute the overlap with the in-pipe window
-    [Vd - Vpipe, Vd], map to distances, and return per-batch segment info.
-    """
-    # Pumped-volume intervals for each batch
-    vols = batches_df["volume (m3)"].astype(float).clip(lower=0.0).to_numpy()
-    types = batches_df["type"].astype(str).to_numpy()
-    dens  = batches_df["density (kg/m3)"].astype(float).to_numpy()
-    visc  = batches_df["viscosity (cSt)"].astype(float).to_numpy()
+    # Volume and length of the current section
+    vol_section = cumulative_volumes[section_index] - vol_before
+    len_section = cumulative_lengths_km[section_index] - len_before
 
-    v_starts = np.concatenate(([0.0], np.cumsum(vols)[:-1]))
-    v_ends   = np.cumsum(vols)
+    # Volume within the current section
+    vol_in_section = volume_m3 - vol_before
 
-    # In-pipe window
-    win_start = max(V_displaced - V_pipe, 0.0)
-    win_end   = max(min(V_displaced, v_ends[-1] if len(v_ends) else 0.0), 0.0)
+    # Calculate distance within the current section
+    dist_in_section = (vol_in_section / vol_section) * len_section if vol_section > 0 else 0
 
-    segments = []
-    rows = []
+    return len_before + dist_in_section
 
-    for i, (v0, v1, t, d, mu) in enumerate(zip(v_starts, v_ends, types, dens, visc)):
-        # Compute overlap with in-pipe window
-        ov_start = max(v0, win_start)
-        ov_end   = min(v1, win_end)
-        inside_vol = max(ov_end - ov_start, 0.0)
 
-        if inside_vol > 0:
-            # Map overlap to distances
-            local_start = ov_start - win_start  # 0 at inlet
-            local_end   = ov_end - win_start
-            x0 = float(dist_from_local_volume(np.array([local_start]), A_m2, cumV_sec, cumL_sec)[0])
-            x1 = float(dist_from_local_volume(np.array([local_end]),   A_m2, cumV_sec, cumL_sec)[0])
-            x_start, x_end = (min(x0, x1), max(x0, x1))
-            L_seg = x_end - x_start
+def create_visual_representation(locations_df, pipeline_df, total_length_km):
+    """Creates a Plotly figure to visualize batch locations."""
+    
+    # Define a color map for product types
+    product_types = locations_df['Type'].unique()
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+    color_map = {ptype: colors[i % len(colors)] for i, ptype in enumerate(product_types)}
 
-            segments.append({
-                "batch_index": i + 1,
-                "type": t,
-                "start_m": x_start,
-                "end_m": x_end,
-                "length_m": L_seg,
-                "density_kgm3": d,
-                "visc_cSt": mu,
-                "inside_vol_m3": inside_vol,
-            })
+    fig = go.Figure()
 
-            rows.append({
-                "Batch": i + 1,
-                "Type": t,
-                "Total volume (m3)": vols[i],
-                "In-pipe volume (m3)": inside_vol,
-                "Start (km)": x_start / KM_TO_M,
-                "End (km)": x_end / KM_TO_M,
-                "Center (km)": (x_start + x_end) / (2.0 * KM_TO_M),
-                "Percent inside (%)": 100.0 * inside_vol / vols[i] if vols[i] > 0 else 0.0,
-                "Status": "Inside",
-            })
-        else:
-            # Status outside the pipe
-            status = "Not yet entered" if v1 <= win_start else "Already passed"
-            rows.append({
-                "Batch": i + 1,
-                "Type": t,
-                "Total volume (m3)": vols[i],
-                "In-pipe volume (m3)": 0.0,
-                "Start (km)": None,
-                "End (km)": None,
-                "Center (km)": None,
-                "Percent inside (%)": 0.0,
-                "Status": status,
-            })
-
-    seg_df = pd.DataFrame(segments)
-    loc_df = pd.DataFrame(rows)
-    return seg_df, loc_df
-
-def default_batches():
-    return pd.DataFrame([
-        {"volume (m3)": 1200.0, "type": "HSD", "density (kg/m3)": 830.0, "viscosity (cSt)": 3.0},
-        {"volume (m3)": 900.0,  "type": "MS",  "density (kg/m3)": 740.0, "viscosity (cSt)": 1.0},
-        {"volume (m3)": 1500.0, "type": "ATF", "density (kg/m3)": 800.0, "viscosity (cSt)": 1.5},
-    ])
-
-def default_sections():
-    return pd.DataFrame([
-        {"pipeline section": "Section 1", "diameter (inch)": 18.0, "wall thickness (inch)": 0.375, "length (km)": 40.0},
-        {"pipeline section": "Section 2", "diameter (inch)": 16.0, "wall thickness (inch)": 0.344, "length (km)": 60.0},
-        {"pipeline section": "Section 3", "diameter (inch)": 14.0, "wall thickness (inch)": 0.312, "length (km)": 50.0},
-    ])
-
-# -----------------------------
-# Sidebar inputs
-# -----------------------------
-with st.sidebar:
-    st.header("Operating inputs")
-
-    flow_rate = st.number_input("Flow rate (m3/h)", min_value=0.0, value=800.0, step=50.0, format="%.2f")
-
-    # Datetime inputs
-    start_dt = st.datetime_input("Start date & time", value=datetime.now() - timedelta(hours=2))
-    view_dt  = st.datetime_input("View date & time",  value=datetime.now())
-
-    if view_dt < start_dt:
-        st.info("View time is before start time. No batches in pipe yet.")
-    elapsed_h = max((view_dt - start_dt).total_seconds() / 3600.0, 0.0)
-
-# -----------------------------
-# Main inputs: tables
-# -----------------------------
-st.subheader("Pumping plan (batches)")
-batch_df = st.data_editor(
-    default_batches(),
-    num_rows="dynamic",
-    use_container_width=True,
-    column_config={
-        "volume (m3)": st.column_config.NumberColumn("volume (m3)", min_value=0.0, step=10.0, format="%.2f"),
-        "type": st.column_config.SelectboxColumn("type", options=BATCH_TYPES),
-        "density (kg/m3)": st.column_config.NumberColumn("density (kg/m3)", min_value=0.0, step=1.0, format="%.1f"),
-        "viscosity (cSt)": st.column_config.NumberColumn("viscosity (cSt)", min_value=0.0, step=0.1, format="%.2f"),
-    },
-    key="batches",
-)
-
-st.subheader("Pipeline details (sections)")
-sec_df = st.data_editor(
-    default_sections(),
-    num_rows="dynamic",
-    use_container_width=True,
-    column_config={
-        "pipeline section": st.column_config.TextColumn("pipeline section"),
-        "diameter (inch)": st.column_config.NumberColumn("diameter (inch)", min_value=0.0, step=0.125, format="%.3f"),
-        "wall thickness (inch)": st.column_config.NumberColumn("wall thickness (inch)", min_value=0.0, step=0.01, format="%.3f"),
-        "length (km)": st.column_config.NumberColumn("length (km)", min_value=0.0, step=1.0, format="%.2f"),
-    },
-    key="sections",
-)
-
-# Validate basic inputs
-if batch_df.empty or sec_df.empty:
-    st.warning("Please provide both a pumping plan and pipeline sections.")
-    st.stop()
-
-# -----------------------------
-# Calculations
-# -----------------------------
-# Sections geometry
-ge = sections_from_df(sec_df)
-V_pipe = ge["V_total"]
-L_pipe = ge["L_total"]
-
-# Displaced volume at view time
-V_displaced = flow_rate * elapsed_h
-
-# Batch segments currently inside the pipe
-seg_df, loc_df = compute_batch_segments_in_pipe(
-    batch_df, V_pipe, V_displaced, ge["A_m2"], ge["cumV"], ge["cumL"]
-)
-
-# -----------------------------
-# KPIs
-# -----------------------------
-kpi1, kpi2, kpi3 = st.columns(3)
-kpi1.metric("Pipeline length", f"{L_pipe / KM_TO_M:.2f} km")
-kpi2.metric("Pipeline capacity", f"{V_pipe:,.0f} m³")
-kpi3.metric("Displaced volume", f"{V_displaced:,.0f} m³")
-
-# -----------------------------
-# Locations table
-# -----------------------------
-st.subheader("Batch locations at selected time")
-st.dataframe(loc_df, use_container_width=True)
-
-# -----------------------------
-# Visualization
-# -----------------------------
-st.subheader("Pipeline view")
-
-# Base dataframe for plotting pipeline extent
-pipeline_base = pd.DataFrame({
-    "start_km": [0.0],
-    "end_km": [L_pipe / KM_TO_M],
-    "Type": ["Pipeline"],
-})
-
-# Convert segments to km for plotting
-if not seg_df.empty:
-    plot_df = seg_df.copy()
-    plot_df["start_km"] = plot_df["start_m"] / KM_TO_M
-    plot_df["end_km"]   = plot_df["end_m"]   / KM_TO_M
-    plot_df["Batch"]    = plot_df["batch_index"]
-    plot_df["Type"]     = plot_df["type"]
-else:
-    plot_df = pd.DataFrame(columns=["start_km", "end_km", "Batch", "Type"])
-
-# Define color scheme for types
-color_scale = alt.Scale(
-    domain=["HSD", "MS", "ATF", "HS", "LS"],
-    range=["#3b82f6", "#ef4444", "#22c55e", "#a855f7", "#f59e0b"],
-)
-
-# Pipeline base bar
-pipeline_chart = alt.Chart(pipeline_base).mark_bar(color="#e5e7eb").encode(
-    x="start_km:Q",
-    x2="end_km:Q",
-    y=alt.value(20),
-    tooltip=[alt.Tooltip("end_km:Q", title="Length (km)", format=".2f")]
-)
-
-# Batch segments bars
-if not plot_df.empty:
-    seg_chart = alt.Chart(plot_df).mark_bar().encode(
-        x=alt.X("start_km:Q", title="Distance along pipeline (km)", scale=alt.Scale(domain=[0, L_pipe / KM_TO_M])),
-        x2="end_km:Q",
-        y=alt.value(20),
-        color=alt.Color("Type:N", scale=color_scale),
-        tooltip=[
-            alt.Tooltip("Batch:Q"),
-            alt.Tooltip("Type:N"),
-            alt.Tooltip("start_km:Q", title="Start (km)", format=".2f"),
-            alt.Tooltip("end_km:Q", title="End (km)", format=".2f"),
-            alt.Tooltip("length_m:Q", title="Length (m)", format=".0f"),
-        ],
+    # Add a line for the main pipeline axis
+    fig.add_shape(
+        type="line",
+        x0=0, y0=0, x1=total_length_km, y1=0,
+        line=dict(color="Gray", width=5)
     )
-    chart = (pipeline_chart + seg_chart).properties(height=80, width=900)
+
+    # Add rectangles for each batch
+    for index, row in locations_df.iterrows():
+        start_km = row['Start Location (km)']
+        end_km = row['End Location (km)']
+        
+        if end_km > start_km: # Only draw if the batch has a length
+            fig.add_shape(
+                type="rect",
+                x0=start_km,
+                y0=-0.5,
+                x1=end_km,
+                y1=0.5,
+                fillcolor=color_map.get(row['Type'], 'lightgrey'),
+                line=dict(width=0),
+                opacity=0.8,
+            )
+            # Add annotation for the batch
+            fig.add_annotation(
+                x=(start_km + end_km) / 2,
+                y=0,
+                text=f"<b>{row['Batch']}</b><br>({row['Type']})",
+                showarrow=False,
+                font=dict(color="white", size=10),
+                yshift=0
+            )
+
+    # Add markers for pipeline section joints
+    cumulative_length = 0
+    for index, row in pipeline_df.iterrows():
+        cumulative_length += row['Length (km)']
+        if cumulative_length < total_length_km:
+            fig.add_shape(
+                type="line",
+                x0=cumulative_length, y0=-0.7, x1=cumulative_length, y1=0.7,
+                line=dict(color="Black", width=2, dash="dash")
+            )
+            fig.add_annotation(
+                x=cumulative_length, y=-0.8,
+                text=f"Sec {index+1}-{index+2}",
+                showarrow=False,
+                yshift=-10
+            )
+
+    fig.update_layout(
+        title="Pipeline Batch Visualization",
+        xaxis_title="Distance (km)",
+        yaxis_title="",
+        yaxis=dict(showticklabels=False, range=[-2, 2]),
+        xaxis=dict(range=[0, total_length_km * 1.05]),
+        height=300,
+        margin=dict(l=20, r=20, t=40, b=20),
+        showlegend=False
+    )
+    return fig
+
+# --- Main Application UI ---
+st.title("🛤️ Pipeline Batch Tracker")
+st.markdown("An interactive tool to simulate and track the position of different product batches within a pipeline system at a specific time.")
+
+# --- User Inputs ---
+st.header("1. Define System Parameters")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("Pumping Plan")
+    # Sample data for the pumping plan
+    pumping_data = {
+        "Volume (m3)": [1500, 2000, 1200, 2500],
+        "Type": ["HSD", "ATF", "MS", "HSD"],
+        "Density (kg/m3)": [830, 790, 740, 835],
+        "Viscosity (cSt)": [3.5, 1.2, 0.6, 3.8],
+    }
+    pumping_plan_df = pd.DataFrame(pumping_data)
+    pumping_plan_df.index = [f"Batch {i+1}" for i in pumping_plan_df.index]
+    
+    edited_pumping_plan = st.data_editor(
+        pumping_plan_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "Type": st.column_config.SelectboxColumn(
+                "Type",
+                options=["LS", "HS", "MS", "HSD", "ATF", "Kero"],
+                required=True,
+            )
+        }
+    )
+
+with col2:
+    st.subheader("Pipeline Details")
+    # Sample data for pipeline details
+    pipeline_data = {
+        "Diameter (inch)": [16, 14, 16],
+        "Wall Thickness (inch)": [0.250, 0.250, 0.312],
+        "Length (km)": [120, 80, 150],
+    }
+    pipeline_df = pd.DataFrame(pipeline_data)
+    pipeline_df.index = [f"Section {i+1}" for i in pipeline_df.index]
+    
+    edited_pipeline_df = st.data_editor(
+        pipeline_df,
+        num_rows="dynamic",
+        use_container_width=True
+    )
+
+st.header("2. Set Operational Conditions")
+
+col3, col4 = st.columns(2)
+
+with col3:
+    flow_rate_m3h = st.number_input("Flow Rate (m3/h)", min_value=1, value=500)
+
+with col4:
+    st.subheader("Select Time")
+    start_date = st.date_input("Pumping Start Date", datetime.date(2024, 7, 20))
+    start_time = st.time_input("Pumping Start Time", datetime.time(6, 0))
+    start_datetime = datetime.datetime.combine(start_date, start_time)
+
+    st.markdown("---")
+
+    current_date = st.date_input("Date for Location Check", datetime.datetime.now().date())
+    current_time = st.time_input("Time for Location Check", datetime.datetime.now().time())
+    current_datetime = datetime.datetime.combine(current_date, current_time)
+
+# --- Calculation and Display ---
+st.header("3. Batch Location Results")
+
+# Validate inputs before proceeding
+if edited_pumping_plan.empty or edited_pipeline_df.empty or flow_rate_m3h <= 0:
+    st.warning("Please ensure the Pumping Plan, Pipeline Details, and a valid Flow Rate are provided.")
+elif current_datetime < start_datetime:
+    st.error("The 'Time for Location Check' cannot be before the 'Pumping Start Time'.")
 else:
-    chart = pipeline_chart.properties(height=80, width=900)
+    try:
+        # --- Pipeline Calculations ---
+        pipeline_calc_df = edited_pipeline_df.copy()
+        pipeline_calc_df['Inner Diameter (m)'] = convert_to_m(pipeline_calc_df['Diameter (inch)'] - 2 * pipeline_calc_df['Wall Thickness (inch)'], 'inch')
+        pipeline_calc_df['Area (m2)'] = np.pi * (pipeline_calc_df['Inner Diameter (m)'] / 2)**2
+        pipeline_calc_df['Volume (m3)'] = pipeline_calc_df['Area (m2)'] * convert_to_m(pipeline_calc_df['Length (km)'], 'km')
+        pipeline_calc_df['Cumulative Volume (m3)'] = pipeline_calc_df['Volume (m3)'].cumsum()
+        pipeline_calc_df['Cumulative Length (km)'] = pipeline_calc_df['Length (km)'].cumsum()
+        
+        total_pipeline_length_km = pipeline_calc_df['Length (km)'].sum()
+        total_pipeline_volume_m3 = pipeline_calc_df['Volume (m3)'].sum()
 
-st.altair_chart(chart, use_container_width=True)
+        # --- Batch Location Calculations ---
+        time_diff_seconds = (current_datetime - start_datetime).total_seconds()
+        time_diff_hours = time_diff_seconds / 3600
+        total_pumped_volume = flow_rate_m3h * time_diff_hours
 
-# -----------------------------
-# Section markers (optional)
-# -----------------------------
-with st.expander("Show pipeline section markers"):
-    # Create markers at section boundaries
-    boundaries_km = ge["cumL"] / KM_TO_M
-    marks = pd.DataFrame({"km": boundaries_km})
-    rule = alt.Chart(marks).mark_rule(color="#9ca3af", strokeDash=[4,4]).encode(x="km:Q")
-    st.altair_chart((chart + rule).properties(height=100, width=900), use_container_width=True)
+        # Create a copy to avoid SettingWithCopyWarning
+        batch_locations_df = edited_pumping_plan.copy()
+        batch_locations_df.reset_index(inplace=True)
+        batch_locations_df.rename(columns={'index': 'Batch'}, inplace=True)
+        
+        batch_locations_df['Cumulative Volume (m3)'] = batch_locations_df['Volume (m3)'].cumsum()
 
-# -----------------------------
-# Notes
-# -----------------------------
-st.markdown("""
-- Assumes plug flow with sharp interfaces, no mixing or slippage.
-- Inner diameter is computed as `ID = diameter − 2 × wall thickness` (inches). Ensure inputs reflect OD and wall thickness consistently.
-- If view time is early, part of the line may be unfilled; if late, some batches may have already passed.
-""")
+        locations = []
+        
+        for i, batch in batch_locations_df.iterrows():
+            vol_at_batch_end = total_pumped_volume - (batch['Cumulative Volume (m3)'] - batch['Volume (m3)'])
+            vol_at_batch_start = total_pumped_volume - batch['Cumulative Volume (m3)']
+
+            end_km = get_distance_from_volume(
+                vol_at_batch_end,
+                pipeline_calc_df['Cumulative Volume (m3)'].values,
+                pipeline_calc_df['Cumulative Length (km)'].values
+            )
+            
+            start_km = get_distance_from_volume(
+                vol_at_batch_start,
+                pipeline_calc_df['Cumulative Volume (m3)'].values,
+                pipeline_calc_df['Cumulative Length (km)'].values
+            )
+            
+            locations.append({
+                "Batch": batch['Batch'],
+                "Type": batch['Type'],
+                "Start Location (km)": round(start_km, 2),
+                "End Location (km)": round(end_km, 2),
+                "Length in Pipe (km)": round(end_km - start_km, 2)
+            })
+
+        final_locations_df = pd.DataFrame(locations)
+
+        # --- Display Results ---
+        st.subheader("Visual Representation")
+        st.info(f"Showing batch locations for **{current_datetime.strftime('%Y-%m-%d %H:%M')}**. "
+                f"Total pumped volume: **{total_pumped_volume:,.2f} m³**.")
+
+        # Filter out batches that haven't entered the pipeline yet
+        visible_batches_df = final_locations_df[final_locations_df['End Location (km)'] > 0]
+        
+        if visible_batches_df.empty:
+            st.warning("No batches have entered the pipeline at the selected time.")
+        else:
+            fig = create_visual_representation(visible_batches_df, pipeline_calc_df, total_pipeline_length_km)
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Location Data Table")
+        st.dataframe(final_locations_df, use_container_width=True, hide_index=True)
+
+        # --- Expander for Detailed Calculations ---
+        with st.expander("View Detailed Pipeline Calculations"):
+            st.dataframe(pipeline_calc_df)
+            st.markdown(f"**Total Pipeline Length:** {total_pipeline_length_km:,.2f} km")
+            st.markdown(f"**Total Pipeline Volume:** {total_pipeline_volume_m3:,.2f} m³")
+
+    except Exception as e:
+        st.error(f"An error occurred during calculation: {e}")
+        st.error("Please check your input data. All numerical columns must contain valid numbers.")
+
