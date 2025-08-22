@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
 import math
 
 st.set_page_config(page_title="Pipeline Batch Tracker", layout="wide")
@@ -81,11 +80,9 @@ if not pipe_df.empty:
 st.subheader("📊 Visual Representation")
 
 if not batch_df.empty:
-    fig = px.bar(batch_df, x="Type", y="Volume (m³)", color="Type", title="Batch Volumes by Type")
-    st.plotly_chart(fig, use_container_width=True)
+    st.bar_chart(batch_df.set_index("Type")["Volume (m³)"])
 
 if not pipe_df.empty:
-    fig2 = px.line(pipe_df, x=pipe_df.index+1, y="Length (km)", title="Pipeline Section Lengths", markers=True)
-    st.plotly_chart(fig2, use_container_width=True)
+    st.line_chart(pipe_df["Length (km)"])
 
 st.success("✅ Data captured and calculations done!")
