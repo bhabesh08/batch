@@ -12,19 +12,25 @@ flow_rate = st.number_input("Enter Flow Rate (m³/h):", min_value=0.0, step=10.0
 
 # Input 2: Pumping Plan (Batches)
 st.subheader("Batch Pumping Plan")
-batch_rows = st.number_input("Number of batches:", min_value=1, step=1, value=2)
+batch_rows = st.number_input("Number of batches:", min_value=1, step=1, value=3)
 
-batch_data = []
-for i in range(batch_rows):
-    st.markdown(f"### Batch {i+1}")
-    vol = st.number_input(f"Volume (m³) - Batch {i+1}", min_value=0.0, step=10.0, key=f"vol_{i}")
-    typ = st.selectbox(f"Type - Batch {i+1}", ["LS", "HS", "MS", "HSD", "ATF"], key=f"typ_{i}")
-    dens = st.number_input(f"Density (kg/m³) - Batch {i+1}", min_value=0.0, step=10.0, key=f"dens_{i}")
-    visc = st.number_input(f"Viscosity (cSt) - Batch {i+1}", min_value=0.0, step=1.0, key=f"visc_{i}")
-    time_hr = vol / flow_rate if flow_rate > 0 else 0
-    batch_data.append([vol, typ, dens, visc, time_hr])
+# Default batch data
+default_batches = pd.DataFrame({
+    "Batch": [f"Batch {i+1}" for i in range(batch_rows)],
+    "Volume (m³)": [0.0]*batch_rows,
+    "Type": ["LS"]*batch_rows,
+    "Density (kg/m³)": [850.0]*batch_rows,
+    "Viscosity (cSt)": [1.0]*batch_rows
+})
 
-batch_df = pd.DataFrame(batch_data, columns=["Volume (m³)", "Type", "Density (kg/m³)", "Viscosity (cSt)", "Time (h)"])
+# Editable batch table
+batch_df = st.data_editor(default_batches, num_rows="dynamic")
+
+# Add pumping time calculation
+if not batch_df.empty and flow_rate > 0:
+    batch_df["Time (h)"] = batch_df["Volume (m³)"] / flow_rate
+else:
+    batch_df["Time (h)"] = 0
 
 st.write("### Pumping Plan Table")
 st.dataframe(batch_df)
@@ -37,12 +43,23 @@ if not batch_df.empty:
 st.subheader("Pipeline Details")
 pipe_sections = st.number_input("Number of pipeline sections:", min_value=1, step=1, value=3)
 
-pipe_data = []
-for j in range(pipe_sections):
-    st.markdown(f"### Section {j+1}")
-    dia = st.number_input(f"Diameter (inch) - Section {j+1}", min_value=0.0, step=0.5, key=f"dia_{j}")
-    thk = st.number_input(f"Wall Thickness (inch) - Section {j+1}", min_value=0.0, step=0.1, key=f"thk_{j}")
-    length = st.number_input(f"Length (km) - Section {j+1}", min_value=0.0, step=1.0, key=f"len_{j}")
+# Default pipeline data
+default_pipes = pd.DataFrame({
+    "Section": [f"Section {j+1}" for j in range(pipe_sections)],
+    "Diameter (inch)": [24.0]*pipe_sections,
+    "Wall Thickness (inch)": [0.5]*pipe_sections,
+    "Length (km)": [10.0]*pipe_sections
+})
+
+# Editable pipeline table
+pipe_df = st.data_editor(default_pipes, num_rows="dynamic")
+
+# Calculate pipeline properties
+pipe_results = []
+for _, row in pipe_df.iterrows():
+    dia = row["Diameter (inch)"]
+    thk = row["Wall Thickness (inch)"]
+    length = row["Length (km)"]
 
     # Convert to meters
     dia_m = dia * 0.0254
@@ -63,26 +80,26 @@ for j in range(pipe_sections):
     f = 0.02  # assumed friction factor
     dp = f * (length_m/dia_m) * (avg_density * velocity**2 / 2) if dia_m > 0 else 0
 
-    pipe_data.append([dia, thk, length, vol_pipe, dp/1e5])  # store pressure in bar approx
+    pipe_results.append([dia, thk, length, vol_pipe, dp/1e5])  # store pressure in bar approx
 
-pipe_df = pd.DataFrame(pipe_data, columns=["Diameter (inch)", "Wall Thickness (inch)", "Length (km)", "Volume (m³)", "ΔP (bar)"])
+pipe_results_df = pd.DataFrame(pipe_results, columns=["Diameter (inch)", "Wall Thickness (inch)", "Length (km)", "Volume (m³)", "ΔP (bar)"])
 
-st.write("### Pipeline Table")
-st.dataframe(pipe_df)
+st.write("### Pipeline Table with Calculations")
+st.dataframe(pipe_results_df)
 
-if not pipe_df.empty:
-    total_pipe_vol = pipe_df["Volume (m³)"].sum()
+if not pipe_results_df.empty:
+    total_pipe_vol = pipe_results_df["Volume (m³)"].sum()
     st.info(f"🛢️ Total Pipeline Volume: {total_pipe_vol:.2f} m³")
-    total_dp = pipe_df["ΔP (bar)"].sum()
+    total_dp = pipe_results_df["ΔP (bar)"].sum()
     st.info(f"📉 Estimated Total Pressure Drop: {total_dp:.2f} bar")
 
 # Visual Representation
 st.subheader("📊 Visual Representation")
 
 if not batch_df.empty:
-    st.bar_chart(batch_df.set_index("Type")["Volume (m³)"])
+    st.bar_chart(batch_df.set_index("Batch")["Volume (m³)"])
 
-if not pipe_df.empty:
-    st.line_chart(pipe_df["Length (km)"])
+if not pipe_results_df.empty:
+    st.line_chart(pipe_results_df["Length (km)"])
 
 st.success("✅ Data captured and calculations done!")
