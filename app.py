@@ -32,9 +32,6 @@ if not batch_df.empty and flow_rate > 0:
 else:
     batch_df["Time (h)"] = 0
 
-st.write("### Pumping Plan Table")
-st.dataframe(batch_df)
-
 if not batch_df.empty:
     total_time = batch_df["Time (h)"].sum()
     st.info(f"⏱️ Total Pumping Time: {total_time:.2f} hours")
